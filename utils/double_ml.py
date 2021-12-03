@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
+from sklearn.model_selection import KFold, StratifiedKFold
 
 # get Q(1,x) and Q(0,x) given fitted Q
 def get_outcome_pred(q, X_Q, binary=False, ATT=False):
