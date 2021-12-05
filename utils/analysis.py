@@ -1,8 +1,15 @@
 from utils.double_ml import *
 import pandas as pd
 import numpy as np
+from sklearn.metrics import mean_squared_error, log_loss
+from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from xgboost import XGBClassifier, XGBRegressor
 from scipy.stats import ttest_ind
 from scipy.stats import t
+
+
 
 # =================== dataframe gymnastics ===================
 wf = pd.read_csv("data/wf.csv")
@@ -14,18 +21,7 @@ wf.drop('Unnamed: 0', axis = 1)
 city_yb = pd.read_csv("data/city_yb.csv")
 city_yb.drop('Unnamed: 0', axis = 1)
 
-wf.drop('Unnamed: 0', axis = 1)
-city_yb.drop('Unnamed: 0', axis = 1)
-city_yb = city_yb.dropna()
-print(len(wf))
-wf = wf.merge(city_yb, on='city_code').dropna(
-    subset = ['sec_city', 'gdp_city', 'pgdp_city', 
-              'firm_city', 'gonglu', 'emit_ww', 'emit_so1', 'emi_dust1',
-              'aqi', 'pm']
-)
-print(len(wf))
-
-def make_wf2020():
+def make_wf2020(city_var=False):
     wf2020 = wf[(wf["daynum"] >= 8401) & (wf["daynum"]<= 8461)].dropna(
         subset = ['aqi', 'pm']
     )
@@ -34,6 +30,14 @@ def make_wf2020():
     wf2020["l_aqi"] = np.log(1 + wf2020["aqi"])
     wf2020["l_pm"] = np.log(1 + wf2020["pm"])
 
+    if (city_var):
+        city_yb_clean = city_yb.dropna()
+        wf2020 = wf2020.merge(city_yb_clean, on='city_code').dropna(
+            subset = ['sec_city', 'gdp_city', 'pgdp_city', 
+                    'firm_city', 'gonglu', 'emit_ww', 'emit_so1', 'emi_dust1',
+                    'aqi', 'pm'])
+        
+    
     # add column for day of first treatment
     treated = wf2020[wf2020['treat'] == 1]
     treated = treated[['daynum', 'city_code']].groupby('city_code')
@@ -69,6 +73,30 @@ def get_day_count(wf2020):
     num_cities = {d:c for d,c in zip(day, count)}
     return day, count, num_cities
 
+
+def get_model_string(m, m_params):
+    if m == LinearRegression:
+        return "Linear Regression"
+    if m == LogisticRegression:
+        return "Logistic Regression"
+    if m == RandomForestRegressor:
+        return "Random Forest Regressor (depth " + str(m_params['max_depth']) + ")"
+    if m == RandomForestClassifier:
+        return "Random Forest Classifier (depth " + str(m_params['max_depth']) + ")"
+    if m == XGBRegressor:
+        return "XGBoost Regressor"
+    if m == XGBClassifier:
+        return "XGBoost Classifier"
+
+def get_var_string(s):
+    if s == 'aqi':
+        return 'AQI'
+    if s == 'l_aqi':
+        return 'log AQI'
+    if s == 'pm':
+        return 'PM'
+    else:
+        return 'log PM'
 
 # =================== estimation functions ===================
 
@@ -112,6 +140,77 @@ def single_period_estimate(wf2020, treat_day, outcome_var, confounder_list,
     return tau_hat, std_hat, Q_model, g_model
 
 
+def test_single_models(wf2020, treat_day, outcome_var, confounder_list, 
+                       Q_model_class, g_model_class, Q_model_params={}, g_model_params={}):
+    wf2020 = wf2020.copy()
+    group = get_group(wf2020, treat_day)
+    group.loc[:, 'pre'] = group['daynum'] < treat_day
+    group = group.groupby(['city_code', 'pre']).mean().reset_index('pre')
+    compact = group[~group['pre']]
+    out = group[outcome_var].values
+    compact.loc[:, 'Y1-Y0'] = out[~group['pre']] - out[group['pre']]
+
+    compact = compact.reset_index()
+    outcome = compact['Y1-Y0']
+    treatment = compact['treat']
+    confounders = compact[confounder_list]
+
+    # Q_model = Q_model_class(**Q_model_params)
+    X_w_treatment = confounders.copy()
+    X_w_treatment["treatment"] = treatment
+
+
+    Q_mses = []
+    mse_baselines = []
+    kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
+    for train_index, test_index in kf.split(X_w_treatment, outcome):
+        X_train, X_test = X_w_treatment.loc[train_index], X_w_treatment.loc[test_index]
+        y_train, y_test = outcome.loc[train_index], outcome.loc[test_index]
+        Q_model = Q_model_class(**Q_model_params)
+        Q_model.fit(X_train, y_train)
+        y_pred = Q_model.predict(X_test)
+        Q_mse = mean_squared_error(y_test, y_pred)
+        baseline_mse = mean_squared_error(y_train.mean()*np.ones_like(y_test), y_test)
+        Q_mses.append(Q_mse)
+        mse_baselines.append(baseline_mse)
+    
+    X = confounders.copy()
+    g_ces = []
+    ce_baselines = []
+    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
+    for train_index, test_index in kf.split(X, treatment):
+        X_train, X_test= X.loc[train_index], X.loc[test_index]
+        a_train, a_test = treatment.loc[train_index], treatment.loc[test_index]
+        g_model = g_model_class(**g_model_params)
+        g_model.fit(X_train, a_train)
+        a_pred = g_model.predict_proba(X_test)[:,1]
+        g_ce = log_loss(a_test, a_pred)
+        baseline_ce = log_loss(a_test, a_train.mean()*np.ones_like(a_test))
+        g_ces.append(g_ce)
+        ce_baselines.append(baseline_ce)
+
+
+    # X_train, X_test, y_train, y_test = train_test_split(X_w_treatment, outcome, test_size=0.2, 
+    #                                                     random_state=RANDOM_SEED, stratify=treatment)
+    # # Q_model.fit(X_train, y_train)
+    # y_pred = Q_model.predict(X_test)
+    # Q_mse = mean_squared_error(y_test, y_pred)
+    # baseline_mse = mean_squared_error(y_train.mean()*np.ones_like(y_test), y_test)
+    # print(baseline_mse)
+
+    # g_model = g_model_class(**g_model_params)
+    # X_train, X_test, a_train, a_test = train_test_split(confounders, treatment, test_size=0.2, 
+    #                                                     random_state=RANDOM_SEED, stratify=treatment)
+    # g_model.fit(X_train, a_train)
+    # a_pred = g_model.predict_proba(X_test)[:,1]
+    # g_ce = log_loss(a_test, a_pred)
+
+    # baseline_ce = log_loss(a_test, a_train.mean()*np.ones_like(a_test))
+
+    return np.mean(Q_mses), np.mean(g_ces), np.mean(mse_baselines), np.mean(ce_baselines)
+
+
+
 def multi_period_estimate(wf2020, outcome_var, confounder_list,
                           Q_model_class, g_model_class, Q_model_params={}, g_model_params={}):
     wf2020 = wf2020.copy()
@@ -120,9 +219,18 @@ def multi_period_estimate(wf2020, outcome_var, confounder_list,
         lambda x: pd.Series.rolling(x, window=7).mean()
     )
 
+    # create week rolling mean for each city/day combo
+    # dummy = wf2020.groupby('city_code')[[outcome_var, 'daynum']].rolling(window=7, on='daynum').mean().reset_index()
+    # dummy = dummy.rename(columns={outcome_var: outcome_var+"_avg"})
+    # wf2020 = pd.merge(wf2020, dummy, on = ['city_code', 'daynum'])
+
+    # wf2020['diff'] = wf2020.sort_values(by = 'daynum')[outcome_var+"_avg"] \
+    #     - wf2020.sort_values(by = 'daynum').groupby('city_code')[outcome_var+"_avg"].shift(7)
+    # wf2020 = wf2020.dropna(subset= ['diff'])
+
 
     wf2020['diff'] = wf2020.sort_values(by = 'daynum')[outcome_var] \
-            - wf2020.sort_values(by = 'daynum').groupby('city_code')[outcome_var].shift(7)
+            - wf2020.sort_values(by = 'daynum').groupby('city_code')[outcome_var].shift(1)
     wf2020 = wf2020.dropna(subset= ['diff'])
 
     outcome = wf2020['diff']
@@ -171,6 +279,80 @@ def multi_period_estimate(wf2020, outcome_var, confounder_list,
     return tau_hat, std_hat, Q_model, g_model
 
 
+def test_multi_models(wf2020, outcome_var, confounder_list,
+                      Q_model_class, g_model_class, Q_model_params={}, g_model_params={}):
+    wf2020 = wf2020.copy()
+    wf2020['A'] = (wf2020['daynum'] == wf2020['first']).astype('int64')
+    # wf2020['pastweek_mean'] = wf2020.groupby('daynum')[outcome_var].transform(
+    #     lambda x: pd.Series.rolling(x, window=7).mean()
+    # )
+    # create week rolling mean for each city/day combo
+    # dummy = wf2020.groupby('city_code')[[outcome_var, 'daynum']].rolling(window=7, on='daynum').mean().reset_index()
+    # dummy = dummy.rename(columns={outcome_var: outcome_var+"_avg"})
+    # wf2020 = pd.merge(wf2020, dummy, on = ['city_code', 'daynum'])
+
+    # wf2020['diff'] = wf2020.sort_values(by = 'daynum')[outcome_var+"_avg"] \
+    #     - wf2020.sort_values(by = 'daynum').groupby('city_code')[outcome_var+"_avg"].shift(7)
+    # wf2020 = wf2020.dropna(subset= ['diff'])
+
+
+    wf2020['diff'] = wf2020.sort_values(by = 'daynum')[outcome_var] \
+            - wf2020.sort_values(by = 'daynum').groupby('city_code')[outcome_var].shift(1)
+    wf2020 = wf2020.dropna(subset= ['diff'])
+
+    outcome = wf2020['diff']
+    treatment = wf2020['A']
+    confounders = wf2020[confounder_list]
+
+    # Q_model = make_Q_model(Q_model_class, Q_model_params)
+    X_w_treatment = confounders.copy()
+    X_w_treatment["treatment"] = treatment
+
+    Q_mses = []
+    mse_baselines = []
+    kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
+    for train_index, test_index in kf.split(X_w_treatment, outcome):
+        X_train, X_test = X_w_treatment.iloc[train_index], X_w_treatment.iloc[test_index]
+        y_train, y_test = outcome.iloc[train_index], outcome.iloc[test_index]
+        Q_model = Q_model_class(**Q_model_params)
+        Q_model.fit(X_train, y_train)
+        y_pred = Q_model.predict(X_test)
+        Q_mse = mean_squared_error(y_test, y_pred)
+        baseline_mse = mean_squared_error(y_train.mean()*np.ones_like(y_test), y_test)
+        Q_mses.append(Q_mse)
+        mse_baselines.append(baseline_mse)
+    
+    X = confounders.copy()
+    g_ces = []
+    ce_baselines = []
+    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
+    for train_index, test_index in kf.split(X, treatment):
+        X_train, X_test= X.iloc[train_index], X.iloc[test_index]
+        a_train, a_test = treatment.iloc[train_index], treatment.iloc[test_index]
+        g_model = g_model_class(**g_model_params)
+        g_model.fit(X_train, a_train)
+        a_pred = g_model.predict_proba(X_test)[:,1]
+        g_ce = log_loss(a_test, a_pred)
+        baseline_ce = log_loss(a_test, a_train.mean()*np.ones_like(a_test))
+        g_ces.append(g_ce)
+        ce_baselines.append(baseline_ce)
+
+
+    # X_train, X_test, y_train, y_test = train_test_split(X_w_treatment, outcome, test_size=0.2)
+    # Q_model.fit(X_train, y_train)
+    # y_pred = Q_model.predict(X_test)
+    # Q_mse = mean_squared_error(y_pred, y_test)
+    # baseline_mse = mean_squared_error(y_train.mean()*np.ones_like(y_test), y_test)
+
+    # g_model = make_g_model(g_model_class, g_model_params)
+    # X_train, X_test, a_train, a_test = train_test_split(confounders, treatment, test_size=0.2)
+    # g_model.fit(X_train, a_train)
+    # a_pred = g_model.predict_proba(X_test)[:,1]
+    # g_ce = log_loss(a_test, a_pred)
+    # baseline_ce = log_loss(a_test, a_train.mean()*np.ones_like(a_test))
+
+    # return Q_mse, g_ce, baseline_mse, baseline_ce
+    return np.mean(Q_mses), np.mean(g_ces), np.mean(mse_baselines), np.mean(ce_baselines)
 
 # =================== sensitivity/robustness functions ===================
 
@@ -232,3 +414,6 @@ def welch_ttest(x1, x2):
     return pd.DataFrame(np.array([tstat,df,p,delta,lb,ub]).reshape(1,-1),
                          columns=['T statistic','df','pvalue 2 sided','Difference in mean','lb','ub'])
 
+
+
+# check overlap
