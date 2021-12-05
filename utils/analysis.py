@@ -21,7 +21,6 @@ wf.drop('Unnamed: 0', axis = 1)
 city_yb = pd.read_csv("data/city_yb.csv")
 city_yb.drop('Unnamed: 0', axis = 1)
 
-
 def make_wf2020(city_var=False):
     wf2020 = wf[(wf["daynum"] >= 8401) & (wf["daynum"]<= 8461)].dropna(
         subset = ['aqi', 'pm']
@@ -113,6 +112,8 @@ def single_period_estimate(wf2020, treat_day, outcome_var, confounder_list,
     treatment = compact['treat']
     confounders = compact[confounder_list]
     
+    print(outcome)
+    
     g = treatment_k_fold_fit_and_predict(make_g_model, X=confounders, A=treatment, n_splits=10,
                                         model_class=g_model_class, model_params=g_model_params)
     Q0,Q1 = outcome_k_fold_fit_and_predict(make_Q_model, X=confounders, y=outcome, 
@@ -121,8 +122,19 @@ def single_period_estimate(wf2020, treat_day, outcome_var, confounder_list,
     
     data_and_nuisance_estimates = pd.DataFrame({'g': g, 'Q0': Q0, 'Q1': Q1, 'A': treatment, 'Y': outcome})
     tau_hat, std_hat = att_aiptw(**data_and_nuisance_estimates)
+    
+    
+    Q_model = make_Q_model(Q_model_class, Q_model_params)
+    g_model = make_g_model(g_model_class, g_model_params)
+    
+    # include the treatment as input feature
+    X_w_treatment = confounders.copy()
+    X_w_treatment["A"] = treatment
+    
+    Q_model.fit(X_w_treatment, outcome)
+    g_model.fit(confounders, treatment)
 
-    return tau_hat, std_hat
+    return tau_hat, std_hat, Q_model, g_model
 
 
 def test_single_models(wf2020, treat_day, outcome_var, confounder_list, 
@@ -348,9 +360,14 @@ def test_multi_models(wf2020, outcome_var, confounder_list,
 
 def two_period_parallel_trends(wf2020, treat_day, confounder_list, Q_model, g_model):
     res = dict()
-    for day in range(treat_day - 7, treat_day, 1):
+    for period in range(treat_day - 7*4, treat_day, 7):
 
-        df = wf2020[wf2020['daynum'] == day]
+        df = wf2020[(wf2020['daynum'] >= period) & (wf2020['daynum'] < period + 7)]
+
+        
+        df.loc[:, 'pre'] = df['daynum'] < treat_day
+        df = df.groupby(['city_code']).mean().reset_index()
+        
         treated = df[df['first'] == treat_day]
         control = df[df['first'] == 0]
         
@@ -360,14 +377,14 @@ def two_period_parallel_trends(wf2020, treat_day, confounder_list, Q_model, g_mo
         Xt = confounders_t.copy()
         Xc = confounders_c.copy()
         
-        Xt["treatment"] = 0
-        Xc['treatment'] = 0
+        Xt['A'] = 0
+        Xc['A'] = 0
         
         
         Qt = Q_model.predict(Xt)
         Qc = Q_model.predict(Xc)
         
-        res[day] = welch_ttest(Qt, Qc)
+        res[period] = welch_ttest(Qt, Qc)
         
     return res
 
@@ -376,7 +393,6 @@ def welch_ttest(x1, x2):
     n1 = x1.size
     n2 = x2.size
     
-    print(n1, n2)
     m1 = np.mean(x1)
     m2 = np.mean(x2)
     
