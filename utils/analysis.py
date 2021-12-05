@@ -1,6 +1,8 @@
 from utils.double_ml import *
 import pandas as pd
 import numpy as np
+from scipy.stats import ttest_ind
+from scipy.stats import t
 
 # =================== dataframe gymnastics ===================
 wf = pd.read_csv("data/wf.csv")
@@ -59,7 +61,6 @@ def get_day_count(wf2020):
 
 # =================== estimation functions ===================
 
-
 def single_period_estimate(wf2020, treat_day, outcome_var, confounder_list, 
                            Q_model_class, g_model_class, Q_model_params={}, g_model_params={}):
     wf2020 = wf2020.copy()
@@ -74,13 +75,13 @@ def single_period_estimate(wf2020, treat_day, outcome_var, confounder_list,
     outcome = compact['Y1-Y0']
     treatment = compact['treat']
     confounders = compact[confounder_list]
-
+    
     g = treatment_k_fold_fit_and_predict(make_g_model, X=confounders, A=treatment, n_splits=10,
                                         model_class=g_model_class, model_params=g_model_params)
     Q0,Q1 = outcome_k_fold_fit_and_predict(make_Q_model, X=confounders, y=outcome, 
                                           A=treatment, n_splits=10, output_type="continuous",
                                           model_class=Q_model_class, model_params=Q_model_params)
-
+    
     data_and_nuisance_estimates = pd.DataFrame({'g': g, 'Q0': Q0, 'Q1': Q1, 'A': treatment, 'Y': outcome})
     tau_hat, std_hat = att_aiptw(**data_and_nuisance_estimates)
 
@@ -143,16 +144,63 @@ def multi_period_estimate(wf2020, outcome_var, confounder_list,
     tau_hat = (point * inv_var).sum()/inv_var.sum()
     std_hat = np.sqrt(1/inv_var.sum())
     
-    return tau_hat, std_hat
+    return tau_hat, std_hat, Q_model, g_model
 
 
 
 # =================== sensitivity/robustness functions ===================
 
-def parametric_parallel_trends():
-    return
 
+def two_period_parallel_trends(wf2020, treat_day, confounder_list, Q_model, g_model):
+    res = dict()
+    for day in range(treat_day - 7, treat_day, 1):
 
-def two_period_parallel_trends(treat_day, week=False):
-    return
+        df = wf2020[wf2020['daynum'] == day]
+        treated = df[df['first'] == treat_day]
+        control = df[df['first'] == 0]
+        
+        confounders_t = treated[confounder_list]
+        confounders_c = control[confounder_list]
+        
+        Xt = confounders_t.copy()
+        Xc = confounders_c.copy()
+        
+        Xt["treatment"] = 0
+        Xc['treatment'] = 0
+        
+        
+        Qt = Q_model.predict(Xt)
+        Qc = Q_model.predict(Xc)
+        
+        res[day] = welch_ttest(Qt, Qc)
+        
+    return res
+
+def welch_ttest(x1, x2):
+    
+    n1 = x1.size
+    n2 = x2.size
+    
+    print(n1, n2)
+    m1 = np.mean(x1)
+    m2 = np.mean(x2)
+    
+    v1 = np.var(x1, ddof=1)
+    v2 = np.var(x2, ddof=1)
+    
+    pooled_se = np.sqrt(v1 / n1 + v2 / n2)
+    delta = m1-m2
+    
+    tstat = delta /  pooled_se
+    df = (v1 / n1 + v2 / n2)**2 / (v1**2 / (n1**2 * (n1 - 1)) + v2**2 / (n2**2 * (n2 - 1)))
+    
+    # two side t-test
+    p = 2 * t.cdf(-abs(tstat), df)
+    
+    # upper and lower bounds
+    lb = delta - t.ppf(1-0.05/(2),df)*pooled_se 
+    ub = delta + t.ppf(1-0.05/(2),df)*pooled_se
+  
+    return pd.DataFrame(np.array([tstat,df,p,delta,lb,ub]).reshape(1,-1),
+                         columns=['T statistic','df','pvalue 2 sided','Difference in mean','lb','ub'])
 
