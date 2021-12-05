@@ -37,7 +37,6 @@ def make_wf2020(city_var=False):
             subset = ['sec_city', 'gdp_city', 'pgdp_city', 
                     'firm_city', 'gonglu', 'emit_ww', 'emit_so1', 'emi_dust1',
                     'aqi', 'pm'])
-        
     
     # add column for day of first treatment
     treated = wf2020[wf2020['treat'] == 1]
@@ -76,18 +75,16 @@ def get_day_count(wf2020):
 
 
 def get_model_string(m, m_params):
-    if m == LinearRegression:
-        return "Linear Regression"
-    if m == LogisticRegression:
-        return "Logistic Regression"
+    if m == LinearRegression or m == LogisticRegression:
+        return "Lin./Log. Reg"
     if m == RandomForestRegressor:
-        return "Random Forest Regressor (depth " + str(m_params['max_depth']) + ")"
+        return "RF (depth " + str(m_params['max_depth']) + ")"
     if m == RandomForestClassifier:
-        return "Random Forest Classifier (depth " + str(m_params['max_depth']) + ")"
+        return "RF(depth " + str(m_params['max_depth']) + ")"
     if m == XGBRegressor:
-        return "XGBoost Regressor"
+        return "XGBoost"
     if m == XGBClassifier:
-        return "XGBoost Classifier"
+        return "XGBoost"
 
 def get_var_string(s):
     if s == 'aqi':
@@ -304,6 +301,8 @@ def test_multi_models(wf2020, outcome_var, confounder_list,
         y_train, y_test = outcome.iloc[train_index], outcome.iloc[test_index]
         Q_model = Q_model_class(**Q_model_params)
         Q_model.fit(X_train, y_train)
+        # if Q_model != LinearRegression:
+        #     print("Q feature import:", Q_model.feature_importances_)
         y_pred = Q_model.predict(X_test)
         Q_mse = mean_squared_error(y_test, y_pred)
         baseline_mse = mean_squared_error(y_train.mean()*np.ones_like(y_test), y_test)
@@ -319,6 +318,8 @@ def test_multi_models(wf2020, outcome_var, confounder_list,
         a_train, a_test = treatment.iloc[train_index], treatment.iloc[test_index]
         g_model = g_model_class(**g_model_params)
         g_model.fit(X_train, a_train)
+        # if g_model != LogisticRegression:
+            # print("g feature import:", Q_model.feature_importances_)
         a_pred = g_model.predict_proba(X_test)[:,1]
         g_ce = log_loss(a_test, a_pred)
         baseline_ce = log_loss(a_test, a_train.mean()*np.ones_like(a_test))
