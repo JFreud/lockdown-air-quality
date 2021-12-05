@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import KFold, StratifiedKFold
 
-
+RANDOM_SEED = 42
 # estimation fxns adapted from https://github.com/vveitch/causality-tutorials/blob/main/ATE_Estimation_with_Machine_Learning.ipynb
 
 
