@@ -2,98 +2,119 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import KFold, StratifiedKFold
 
-# get Q(1,x) and Q(0,x) given fitted Q
-def get_outcome_pred(q, X_Q, binary=False, ATT=False):
-    X_copy = X_Q.copy()
-    X_copy["treatment"] = 1
-    y_hat1 = q.predict_proba(X_copy) if binary else q.predict(X_copy)
-    X_copy["treatment"] = 0
-    y_hat0 = q.predict_proba(X_copy) if binary else q.predict(X_copy)
-    if ATT:
-        t = X_Q["treatment"]
-        return y_hat1[t==1], y_hat0[t==1]
-    return y_hat1, y_hat0
 
-# estimate ATE/ATT given fitted Q
-def outcome_est(q, X_Q, binary=False, ATT=False):
-    y_hat1, y_hat0 = get_outcome_pred(q, X_Q, binary, ATT)
-    if ATT:
-        return np.mean((y_hat1 - y_hat0)[t==1])
-    return np.mean(y_hat1 - y_hat0)
-        
-# estimate ATE/ATT given fitted g
-def iptw_est(g, t, X, y, ATT=False):
-    ps = g.predict_proba(X)[:,1]
-    weight = (t/ps) - (1-t)/(1-ps) 
-    if ATT:
-        return np.mean((weight * y)[t==1])
-    return np.mean(weight * y)
+# estimation fxns adapted from https://github.com/vveitch/causality-tutorials/blob/main/ATE_Estimation_with_Machine_Learning.ipynb
 
-# estimate ATE/ATT w/ double ML technique given fitted Q, g
-def double_ML(q, g, t, X, X_Q, y, binary=False, ATT=False):
-    y_hat1, y_hat0 = get_outcome_pred(q, X_Q, binary, ATT)
-    ps = g.predict_proba(X)[:,1]
-    if ATT:
-        return (np.mean((
-            y_hat1 - y_hat0 + t/ps * (y - y_hat1) - (1-t)/(1-ps) * (y - y_hat0))[t==1]
-            ))
-    return (np.mean(
-        y_hat1 - y_hat0 + t/ps * (y - y_hat1) - (1-t)/(1-ps) * (y - y_hat0)
-        ))
 
-# estimate influence curve
-def phi(q, g, t, X, X_Q, y, tau, binary=False, ATT=False):
-    y_hat1, y_hat0 = get_outcome_pred(q, X_Q, binary, ATT)
-    ps = g.predict_proba(X)[:,1]
-    if ATT:
-        return (y_hat1 - y_hat0 + 
-        t/ps * (y - y_hat1) - 
-        (1-t)/(1-ps) * (y - y_hat0) -
-        tau)[t==1]
-    return (y_hat1 - y_hat0 + 
-            t/ps * (y - y_hat1) - 
-            (1-t)/(1-ps) * (y - y_hat0) -
-            tau)
+def make_Q_model(model_class, params={}):
+    return model_class(**params) 
+#   return RandomForestRegressor(random_state=RANDOM_SEED, n_estimators=500, max_depth=None)
 
-def cross_fit_doubleML(Q_model, g_model, t, X, y, k=10, ATT=False, Q_model_params={}, g_model_params={}):
-    X_Q = X.copy()
-    X_Q["treatment"] = t
-    binary = ((y==0) | (y==1)).all()
-    if binary:
-        kf = StratifiedKFold(n_splits=k, shuffle=True, random_state=0)
-    else:
-        kf = KFold(n_splits=k, shuffle=True, random_state=0)
 
-    learned_Q, learned_g, estimates = [], [], []
-    # cross fit to get estimate of treatment effect
-    for train_index, fit_index in kf.split(X, y):
-        # split data
-        X_train, X_fit = X.iloc[train_index], X.iloc[fit_index]
-        X_Q_train, X_Q_fit = X_Q.iloc[train_index], X_Q.iloc[fit_index]
-        t_train, t_fit = t.iloc[train_index], t.iloc[fit_index]
-        y_train, y_fit = y.iloc[train_index], y.iloc[fit_index]
-        # get double ML estimate
-        Q = Q_model(**Q_model_params).fit(X_Q_train, y_train) if Q_model_params else Q_model().fit(X_Q_train, y_train)
-        g = g_model(**g_model_params).fit(X_train, t_train) if g_model_params else g_model().fit(X_train, t_train)
-        tau_hat = double_ML(Q, g, t_fit, X_fit, X_Q_fit, y_fit, ATT)
-        learned_Q.append(Q)
-        learned_g.append(g)
-        estimates.append(tau_hat)
-    tau_hat = np.mean(estimates) # NOTE: fine to take mean of means if N/k sufficiently large?
+def make_g_model(model_class, params={}):
+    return model_class(**params) 
+    # return LogisticRegression(max_iter=1000)
+    # return RandomForestClassifier(random_state=RANDOM_SEED, n_estimators=100, max_depth=5)
+
+def treatment_k_fold_fit_and_predict(make_model, X:pd.DataFrame, A:np.array, n_splits:int, model_class, model_params):
+    """
+    Implements K fold cross-fitting for the model predicting the treatment A. 
+    That is, 
+    1. Split data into K folds
+    2. For each fold j, the model is fit on the other K-1 folds
+    3. The fitted model is used to make predictions for each data point in fold j
+    Returns an array containing the predictions  
+
+    Args:
+    model: function that returns sklearn model (which implements fit and predict_prob)
+    X: dataframe of variables to adjust for
+    A: array of treatments
+    n_splits: number of splits to use
+    """
+    predictions = np.full_like(A, np.nan, dtype=float)
+    kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
     
-    # get std errs (reuse learned nuisance functions from above)
-    pred_vars = []
-    i = 0
-    for _, fit_index in kf.split(X):
-        X_fit, X_Q_fit, t_fit, y_fit = X.iloc[fit_index], X_Q.iloc[fit_index], t.iloc[fit_index], y.iloc[fit_index]
-        Q, g = learned_Q[i], learned_g[i]
-        phi_hat = phi(Q, g, t_fit, X_fit, X_Q_fit, y_fit, tau_hat, binary, ATT)
-        pred_vars.append(np.mean(phi_hat ** 2))
-        i += 1
-    var_hat = np.mean(pred_vars)
-    stderr = (var_hat / len(X)) ** 0.5
+    for train_index, test_index in kf.split(X, A):
+        X_train = X.loc[train_index]
+        A_train = A.loc[train_index]
+        g = make_model(model_class, model_params)
+        g.fit(X_train, A_train)
+
+        # get predictions for split
+        predictions[test_index] = g.predict_proba(X.loc[test_index])[:, 1]
+
+    assert np.isnan(predictions).sum() == 0
+    return predictions
+
+
+
+def outcome_k_fold_fit_and_predict(make_model, X:pd.DataFrame, y:np.array, A:np.array, n_splits:int, output_type:str, model_class, model_params):
+    """
+    Implements K fold cross-fitting for the model predicting the outcome Y. 
+    That is, 
+    1. Split data into K folds
+    2. For each fold j, the model is fit on the other K-1 folds
+    3. The fitted model is used to make predictions for each data point in fold j
+    Returns two arrays containing the predictions for all units untreated, all units treated  
+
+    Args:
+    model: function that returns sklearn model (that implements fit and either predict_prob or predict)
+    X: dataframe of variables to adjust for
+    y: array of outcomes
+    A: array of treatments
+    n_splits: number of splits to use
+    output_type: type of outcome, "binary" or "continuous"
+
+    """
+    predictions0 = np.full_like(A, np.nan, dtype=float)
+    predictions1 = np.full_like(y, np.nan, dtype=float)
+    if output_type == 'binary':
+        kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
+    elif output_type == 'continuous':
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
+
+    # include the treatment as input feature
+    X_w_treatment = X.copy()
+    X_w_treatment["A"] = A
+
+    # for predicting effect under treatment / control status for each data point 
+    X0 = X_w_treatment.copy()
+    X0["A"] = 0
+    X1 = X_w_treatment.copy()
+    X1["A"] = 1
+
     
-    return tau_hat, stderr
+    for train_index, test_index in kf.split(X_w_treatment, y):
+        X_train = X_w_treatment.loc[train_index]
+        y_train = y.loc[train_index]
+        q = make_model(model_class, model_params)
+        q.fit(X_train, y_train)
+
+        if output_type =='binary':
+            predictions0[test_index] = q.predict_proba(X0.loc[test_index])[:, 1]
+            predictions1[test_index] = q.predict_proba(X1.loc[test_index])[:, 1]
+        elif output_type == 'continuous':
+            predictions0[test_index] = q.predict(X0.loc[test_index])
+            predictions1[test_index] = q.predict(X1.loc[test_index])
+
+    assert np.isnan(predictions0).sum() == 0
+    assert np.isnan(predictions1).sum() == 0
+    return predictions0, predictions1
 
 
+def att_aiptw(Q0, Q1, g, A, Y, prob_t=None):
+    """
+    # Double ML estimator for the ATT
+    This uses the ATT specific scores, see equation 3.9 of https://www.econstor.eu/bitstream/10419/149795/1/869216953.pdf
+    """
 
+    if prob_t is None:
+        prob_t = A.mean() # estimate marginal probability of treatment
+
+    tau_hat = (A*(Y-Q0) - (1-A)*(g/(1-g))*(Y-Q0)).mean()/ prob_t
+  
+    scores = (A*(Y-Q0) - (1-A)*(g/(1-g))*(Y-Q0) - tau_hat*A) / prob_t
+    n = Y.shape[0] # number of observations
+    std_hat = np.std(scores) / np.sqrt(n)
+
+    return tau_hat, std_hat
