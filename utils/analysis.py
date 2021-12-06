@@ -9,9 +9,8 @@ from xgboost import XGBClassifier, XGBRegressor
 from scipy.stats import ttest_ind
 from scipy.stats import t
 
-
-
 # =================== dataframe gymnastics ===================
+
 wf = pd.read_csv("data/wf.csv")
 wf["temp2"] = wf["temp"] ** 2
 wf["l_aqi"] = np.log(1 + wf["aqi"])
@@ -30,6 +29,7 @@ def make_wf2020(city_var=False):
     wf2020["l_aqi"] = np.log(1 + wf2020["aqi"])
     wf2020["l_pm"] = np.log(1 + wf2020["pm"])
 
+    # merge with city economic and environmental variables
     if (city_var):
         city_yb_clean = city_yb.dropna()
         wf2020 = wf2020.merge(city_yb_clean, on='city_code').dropna(
@@ -62,7 +62,7 @@ def make_wf2020(city_var=False):
 def get_group(wf2020, treat_day):
     return wf2020[(wf2020['first'] == treat_day) | (wf2020['first'] == 0)]
     
-
+# get counts of number treated on each day
 def get_day_count(wf2020):
     treated = wf2020[wf2020['treat'] == 1]
     treated = treated[['daynum', 'city_code']].groupby('city_code')
@@ -97,8 +97,11 @@ def get_var_string(s):
 
 # =================== estimation functions ===================
 
+# two period DiD on specified day
 def single_period_estimate(wf2020, treat_day, outcome_var, confounder_list, 
                            Q_model_class, g_model_class, Q_model_params={}, g_model_params={}):
+
+    # average into one pre and post period
     wf2020 = wf2020.copy()
     group = get_group(wf2020, treat_day)
     group.loc[:, 'pre'] = group['daynum'] < treat_day
@@ -135,6 +138,7 @@ def single_period_estimate(wf2020, treat_day, outcome_var, confounder_list,
     return tau_hat, std_hat, Q_model, g_model
 
 
+# test model fit for two period DiD on the given model classes
 def test_single_models(wf2020, treat_day, outcome_var, confounder_list, 
                        Q_model_class, g_model_class, Q_model_params={}, g_model_params={},
                        only_treated=False):
@@ -191,7 +195,7 @@ def test_single_models(wf2020, treat_day, outcome_var, confounder_list,
 
     return np.mean(Q_mses), np.mean(g_ces), np.mean(mse_baselines), np.mean(ce_baselines)
 
-# given model for g get predictions (for checking overlap)
+# given model for g get predictions from single DiD (for checking overlap)
 def get_ps(g_model, wf2020, treat_day, outcome_var, confounder_list):
     wf2020 = wf2020.copy()
     group = get_group(wf2020, treat_day)
@@ -207,7 +211,7 @@ def get_ps(g_model, wf2020, treat_day, outcome_var, confounder_list):
     ps = g_model.predict_proba(confounders)[:,1]
     return ps
 
-
+# aggregate ATT estimates from multiple periods into one w/ inverse variance weighting scheme
 def multi_period_estimate(wf2020, outcome_var, confounder_list,
                           Q_model_class, g_model_class, Q_model_params={}, g_model_params={}):
     wf2020 = wf2020.copy()
@@ -275,7 +279,7 @@ def multi_period_estimate(wf2020, outcome_var, confounder_list,
     
     return tau_hat, std_hat, Q_model, g_model, res
 
-
+# check model fit for the staggered DiD on the given models
 def test_multi_models(wf2020, outcome_var, confounder_list,
                       Q_model_class, g_model_class, Q_model_params={}, g_model_params={},
                       only_treated=False):
@@ -290,7 +294,6 @@ def test_multi_models(wf2020, outcome_var, confounder_list,
     treatment = wf2020['A']
     confounders = wf2020[confounder_list]
 
-    # Q_model = make_Q_model(Q_model_class, Q_model_params)
     X_w_treatment = confounders.copy()
     X_w_treatment["treatment"] = treatment
 
@@ -331,6 +334,14 @@ def test_multi_models(wf2020, outcome_var, confounder_list,
         ce_baselines.append(baseline_ce)
 
     return np.mean(Q_mses), np.mean(g_ces), np.mean(mse_baselines), np.mean(ce_baselines)
+
+
+# given model for g get predictions from staggered DiD (for checking overlap)
+def get_multi_ps(g_model, wf2020, confounder_list):
+    confounders = wf2020[confounder_list]
+    ps = g_model.predict_proba(confounders)[:,1]
+    return ps
+
 
 # =================== sensitivity/robustness functions ===================
 
