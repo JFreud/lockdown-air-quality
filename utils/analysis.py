@@ -112,8 +112,6 @@ def single_period_estimate(wf2020, treat_day, outcome_var, confounder_list,
     treatment = compact['treat']
     confounders = compact[confounder_list]
     
-    print(outcome)
-    
     g = treatment_k_fold_fit_and_predict(make_g_model, X=confounders, A=treatment, n_splits=10,
                                         model_class=g_model_class, model_params=g_model_params)
     Q0,Q1 = outcome_k_fold_fit_and_predict(make_Q_model, X=confounders, y=outcome, 
@@ -138,9 +136,11 @@ def single_period_estimate(wf2020, treat_day, outcome_var, confounder_list,
 
 
 def test_single_models(wf2020, treat_day, outcome_var, confounder_list, 
-                       Q_model_class, g_model_class, Q_model_params={}, g_model_params={}):
+                       Q_model_class, g_model_class, Q_model_params={}, g_model_params={},
+                       only_treated=False):
     wf2020 = wf2020.copy()
     group = get_group(wf2020, treat_day)
+
     group.loc[:, 'pre'] = group['daynum'] < treat_day
     group = group.groupby(['city_code', 'pre']).mean().reset_index('pre')
     compact = group[~group['pre']]
@@ -152,10 +152,8 @@ def test_single_models(wf2020, treat_day, outcome_var, confounder_list,
     treatment = compact['treat']
     confounders = compact[confounder_list]
 
-    # Q_model = Q_model_class(**Q_model_params)
     X_w_treatment = confounders.copy()
     X_w_treatment["treatment"] = treatment
-
 
     Q_mses = []
     mse_baselines = []
@@ -165,6 +163,11 @@ def test_single_models(wf2020, treat_day, outcome_var, confounder_list,
         y_train, y_test = outcome.loc[train_index], outcome.loc[test_index]
         Q_model = Q_model_class(**Q_model_params)
         Q_model.fit(X_train, y_train)
+        if only_treated:
+            treated_indices = X_test['treatment'] == 1
+            X_test = X_test[treated_indices]
+            y_test = y_test[treated_indices]
+            y_train = y_train.loc[X_train['treatment'] == 1]
         y_pred = Q_model.predict(X_test)
         Q_mse = mean_squared_error(y_test, y_pred)
         baseline_mse = mean_squared_error(y_train.mean()*np.ones_like(y_test), y_test)
@@ -186,26 +189,23 @@ def test_single_models(wf2020, treat_day, outcome_var, confounder_list,
         g_ces.append(g_ce)
         ce_baselines.append(baseline_ce)
 
-
-    # X_train, X_test, y_train, y_test = train_test_split(X_w_treatment, outcome, test_size=0.2, 
-    #                                                     random_state=RANDOM_SEED, stratify=treatment)
-    # # Q_model.fit(X_train, y_train)
-    # y_pred = Q_model.predict(X_test)
-    # Q_mse = mean_squared_error(y_test, y_pred)
-    # baseline_mse = mean_squared_error(y_train.mean()*np.ones_like(y_test), y_test)
-    # print(baseline_mse)
-
-    # g_model = g_model_class(**g_model_params)
-    # X_train, X_test, a_train, a_test = train_test_split(confounders, treatment, test_size=0.2, 
-    #                                                     random_state=RANDOM_SEED, stratify=treatment)
-    # g_model.fit(X_train, a_train)
-    # a_pred = g_model.predict_proba(X_test)[:,1]
-    # g_ce = log_loss(a_test, a_pred)
-
-    # baseline_ce = log_loss(a_test, a_train.mean()*np.ones_like(a_test))
-
     return np.mean(Q_mses), np.mean(g_ces), np.mean(mse_baselines), np.mean(ce_baselines)
 
+# given model for g get predictions (for checking overlap)
+def get_ps(g_model, wf2020, treat_day, outcome_var, confounder_list):
+    wf2020 = wf2020.copy()
+    group = get_group(wf2020, treat_day)
+    group.loc[:, 'pre'] = group['daynum'] < treat_day
+    group = group.groupby(['city_code', 'pre']).mean().reset_index('pre')
+    compact = group[~group['pre']]
+    out = group[outcome_var].values
+    compact.loc[:, 'Y1-Y0'] = out[~group['pre']] - out[group['pre']]
+
+    compact = compact.reset_index()
+    confounders = compact[confounder_list]
+
+    ps = g_model.predict_proba(confounders)[:,1]
+    return ps
 
 
 def multi_period_estimate(wf2020, outcome_var, confounder_list,
@@ -273,25 +273,14 @@ def multi_period_estimate(wf2020, outcome_var, confounder_list,
     tau_hat = (point * inv_var).sum()/inv_var.sum()
     std_hat = np.sqrt(1/inv_var.sum())
     
-    return tau_hat, std_hat, Q_model, g_model
+    return tau_hat, std_hat, Q_model, g_model, res
 
 
 def test_multi_models(wf2020, outcome_var, confounder_list,
-                      Q_model_class, g_model_class, Q_model_params={}, g_model_params={}):
+                      Q_model_class, g_model_class, Q_model_params={}, g_model_params={},
+                      only_treated=False):
     wf2020 = wf2020.copy()
     wf2020['A'] = (wf2020['daynum'] == wf2020['first']).astype('int64')
-    # wf2020['pastweek_mean'] = wf2020.groupby('daynum')[outcome_var].transform(
-    #     lambda x: pd.Series.rolling(x, window=7).mean()
-    # )
-    # create week rolling mean for each city/day combo
-    # dummy = wf2020.groupby('city_code')[[outcome_var, 'daynum']].rolling(window=7, on='daynum').mean().reset_index()
-    # dummy = dummy.rename(columns={outcome_var: outcome_var+"_avg"})
-    # wf2020 = pd.merge(wf2020, dummy, on = ['city_code', 'daynum'])
-
-    # wf2020['diff'] = wf2020.sort_values(by = 'daynum')[outcome_var+"_avg"] \
-    #     - wf2020.sort_values(by = 'daynum').groupby('city_code')[outcome_var+"_avg"].shift(7)
-    # wf2020 = wf2020.dropna(subset= ['diff'])
-
 
     wf2020['diff'] = wf2020.sort_values(by = 'daynum')[outcome_var] \
             - wf2020.sort_values(by = 'daynum').groupby('city_code')[outcome_var].shift(1)
@@ -313,8 +302,13 @@ def test_multi_models(wf2020, outcome_var, confounder_list,
         y_train, y_test = outcome.iloc[train_index], outcome.iloc[test_index]
         Q_model = Q_model_class(**Q_model_params)
         Q_model.fit(X_train, y_train)
-        # if Q_model != LinearRegression:
-        #     print("Q feature import:", Q_model.feature_importances_)
+        
+        # see how well we can predict outcome on treated (spoiler: we can't)
+        if only_treated:
+            treated_indices = X_test['treatment'] == 1
+            X_test = X_test[treated_indices]
+            y_test = y_test[treated_indices]
+            y_train = y_train.loc[X_train['treatment'] == 1]
         y_pred = Q_model.predict(X_test)
         Q_mse = mean_squared_error(y_test, y_pred)
         baseline_mse = mean_squared_error(y_train.mean()*np.ones_like(y_test), y_test)
@@ -330,29 +324,12 @@ def test_multi_models(wf2020, outcome_var, confounder_list,
         a_train, a_test = treatment.iloc[train_index], treatment.iloc[test_index]
         g_model = g_model_class(**g_model_params)
         g_model.fit(X_train, a_train)
-        # if g_model != LogisticRegression:
-            # print("g feature import:", Q_model.feature_importances_)
         a_pred = g_model.predict_proba(X_test)[:,1]
         g_ce = log_loss(a_test, a_pred)
         baseline_ce = log_loss(a_test, a_train.mean()*np.ones_like(a_test))
         g_ces.append(g_ce)
         ce_baselines.append(baseline_ce)
 
-
-    # X_train, X_test, y_train, y_test = train_test_split(X_w_treatment, outcome, test_size=0.2)
-    # Q_model.fit(X_train, y_train)
-    # y_pred = Q_model.predict(X_test)
-    # Q_mse = mean_squared_error(y_pred, y_test)
-    # baseline_mse = mean_squared_error(y_train.mean()*np.ones_like(y_test), y_test)
-
-    # g_model = make_g_model(g_model_class, g_model_params)
-    # X_train, X_test, a_train, a_test = train_test_split(confounders, treatment, test_size=0.2)
-    # g_model.fit(X_train, a_train)
-    # a_pred = g_model.predict_proba(X_test)[:,1]
-    # g_ce = log_loss(a_test, a_pred)
-    # baseline_ce = log_loss(a_test, a_train.mean()*np.ones_like(a_test))
-
-    # return Q_mse, g_ce, baseline_mse, baseline_ce
     return np.mean(Q_mses), np.mean(g_ces), np.mean(mse_baselines), np.mean(ce_baselines)
 
 # =================== sensitivity/robustness functions ===================
